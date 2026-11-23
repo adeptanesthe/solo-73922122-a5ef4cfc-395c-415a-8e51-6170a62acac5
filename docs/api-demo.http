@@ -44,3 +44,41 @@ GET http://localhost:8000/api/recordings/{{recording_id}}/versions/1/cue.wav
 
 ### 6. 录音元数据与版本历史
 GET http://localhost:8000/api/recordings/{{recording_id}}
+
+# ---------------------------------------------------------------------------
+# 增量重解演示（三小节）：挪动一处确认拍，隔着未动的确认拍改变另一小节的留白
+# 前提：python3 scripts/make_demo_inputs.py /tmp/demo 已生成 take3.wav / annotation3.json
+# 第 1 版确认拍 1、5、9、12；第 10 拍在 369/370 并列 → 第 3 小节留白
+
+### 7. 上传三小节录音，创建第 1 版（第 3 小节留白）
+POST http://localhost:8000/api/recordings
+Content-Type: multipart/form-data; boundary=----demo3
+
+------demo3
+Content-Disposition: form-data; name="audio"; filename="take3.wav"
+Content-Type: audio/wav
+
+< /tmp/demo/take3.wav
+------demo3
+Content-Disposition: form-data; name="annotation"
+
+{"measure_count": 3, "min_gap_frames": 38, "max_gap_frames": 46, "confirmed_beats": [{"beat": 1, "frame": 10}, {"beat": 5, "frame": 170}, {"beat": 9, "frame": 330}, {"beat": 12, "frame": 450}], "onset_scores": [0, ...]}
+------demo3--
+
+### 8. 只挪动第 5 拍（170 → 172），其余确认拍不动 → 第 2 版
+# 第 3 小节（隔着未改动的确认拍 9）从留白变为有提示；
+# 求解复用第 1 版改动点之前的前向状态与之后的后向状态，
+# 服务端日志可见类似：
+#   reannotation recording=... version=2 changed_beats=[5] \
+#   forward_computed=8 forward_reused=3 backward_computed=4 backward_reused=7
+# （12 拍全量求解需 11 层前向 + 11 层后向递推，本次两侧各少算至少一层）
+POST http://localhost:8000/api/recordings/{{recording_id3}}/beats
+Content-Type: application/json
+
+{"confirmed_beats": [{"beat": 1, "frame": 10}, {"beat": 5, "frame": 172}, {"beat": 9, "frame": 330}, {"beat": 12, "frame": 450}]}
+
+### 9. 三小节录音的旧版提示轨 → 409
+GET http://localhost:8000/api/recordings/{{recording_id3}}/versions/1/cue.wav
+
+### 10. 三小节录音的现行版提示轨（第 3 小节已有提示音）
+GET http://localhost:8000/api/recordings/{{recording_id3}}/versions/2/cue.wav

@@ -73,3 +73,55 @@ print(json.dumps({
 }, indent=2, ensure_ascii=False))
 print("version history:", [(v["version"], v["is_current"]) for v in d["versions"]])
 '
+
+echo
+echo "== 8. three-measure recording: measure 3 blank behind confirmed beat 9 =="
+CREATE3="$(curl -sS -X POST "$BASE/api/recordings" \
+  -F "audio=@$TMP/take3.wav;type=audio/wav" \
+  -F "annotation=$(cat "$TMP/annotation3.json")")"
+RID3="$(echo "$CREATE3" | python3 -c 'import json,sys; print(json.load(sys.stdin)["recording_id"])')"
+echo "$CREATE3" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+v = d["current_version"]
+print("version 1: ambiguous_measures =", v["ambiguous_measures"],
+      " cued_measures =", v["cued_measures"])
+print("beat_positions:", v["beat_positions"])
+assert v["ambiguous_measures"] == [3]
+'
+
+echo
+echo "== 9. move confirmed beat 5 by two frames -> version 2 (incremental re-solve) =="
+curl -sS -o "$TMP/move.json" -w "HTTP %{http_code}\n" -X POST \
+  "$BASE/api/recordings/$RID3/beats" \
+  -H 'Content-Type: application/json' --data @"$TMP/reannotation_move.json"
+python3 -c '
+import json
+v = json.load(open("'"$TMP"'/move.json"))
+print("version", v["version"], ": ambiguous_measures =", v["ambiguous_measures"],
+      " cued_measures =", v["cued_measures"])
+print("beat_positions:", v["beat_positions"])
+assert v["ambiguous_measures"] == [] and v["cued_measures"] == [1, 2, 3]
+print("-> measure 3 (behind the unchanged confirmed beat 9) flipped from blank to cued")
+'
+
+echo
+echo "== 10. server log: forward/backward recursion levels reused by the re-solve =="
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  docker compose --project-directory "$SCRIPT_DIR/.." logs --since 15m 2>/dev/null \
+    | grep -E "reannotation .*reused" | tail -3 \
+    || echo "(no reannotation log lines found in the last 15 minutes)"
+else
+  echo "docker compose not available in this shell; the server logs a line like:"
+  echo "  reannotation recording=... version=2 changed_beats=[5] \\"
+  echo "      forward_computed=8 forward_reused=3 backward_computed=4 backward_reused=7"
+fi
+echo "(full solve of 12 beats computes 11 forward + 11 backward levels; the move above"
+echo " reused 3 forward + 7 backward levels from version 1 and still matches a full solve)"
+
+echo
+echo "== 11. old version of the three-measure recording now returns 409 =="
+curl -sS -o "$TMP/old3.json" -w "HTTP %{http_code}\n" \
+  "$BASE/api/recordings/$RID3/versions/1/cue.wav"
+python3 -m json.tool "$TMP/old3.json"

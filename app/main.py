@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import wave
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -17,6 +18,18 @@ from .store import ConfirmedMark, NotFoundError, Store
 from .wav_io import SAMPLE_RATE, AudioValidationError, read_wav
 
 MAX_UPLOAD_BYTES = 4 * 1024 * 1024
+
+# Dedicated logger for re-solve reuse statistics; visible via
+# ``docker compose logs`` when running the container.
+logger = logging.getLogger("cue")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 app = FastAPI(
     title="Choir Rehearsal Cue Track",
@@ -101,6 +114,7 @@ def _solve_or_422(
     max_gap: int,
     marks: list[ConfirmedMark],
     n_frames: int,
+    reuse=None,
 ):
     n_beats = measure_count * BEATS_PER_MEASURE
     _check_frame_bounds(marks, n_beats, n_frames)
@@ -112,6 +126,7 @@ def _solve_or_422(
             min_gap,
             max_gap,
             {m.beat - 1: m.frame for m in marks},
+            reuse=reuse,
         )
     except SolverError as exc:
         raise _http(
@@ -230,10 +245,14 @@ def reannotate(
         raise _http(404, "recording_not_found", str(exc)) from exc
 
     marks = [ConfirmedMark(beat=c.beat, frame=c.frame) for c in payload.confirmed_beats]
+    solved: dict = {}
 
-    def build(recording):
+    def build(recording, prev_state):
         # Raises HTTPException on failure; the store keeps the old version
-        # because nothing is mutated until this function returns.
+        # because nothing is mutated until this function returns.  The store
+        # calls this without holding its lock, so the current version stays
+        # queryable and downloadable while the re-solve runs.  ``prev_state``
+        # carries the current version's reusable DP tables.
         result = _solve_or_422(
             recording.onset_scores,
             recording.measure_count,
@@ -241,7 +260,9 @@ def reannotate(
             recording.max_gap_frames,
             marks,
             recording.audio.n_frames,
+            reuse=prev_state,
         )
+        solved["result"] = result
         return result, _render_cue(
             len(recording.audio.samples), recording.measure_count, result
         )
@@ -260,6 +281,25 @@ def reannotate(
         )
         detail["current_version"] = current
         raise HTTPException(status_code=exc.status_code, detail=detail) from exc
+
+    result = solved["result"]
+    changed = (
+        [beat + 1 for beat in result.changed_beats]
+        if result.changed_beats is not None
+        else "full-solve"
+    )
+    logger.info(
+        "reannotation recording=%s version=%d changed_beats=%s "
+        "forward_computed=%d forward_reused=%d "
+        "backward_computed=%d backward_reused=%d",
+        recording_id,
+        version.number,
+        changed,
+        result.forward_levels_computed,
+        result.forward_levels_reused,
+        result.backward_levels_computed,
+        result.backward_levels_reused,
+    )
 
     snapshot = store.snapshot(recording_id)
     body = next(v for v in snapshot["versions"] if v["version"] == version.number)

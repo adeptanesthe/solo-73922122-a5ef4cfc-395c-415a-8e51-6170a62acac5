@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Tuple
 
-from .solver import SolveResult
+from .solver import SolveResult, SolverState
 from .wav_io import AudioInfo
 
 
@@ -47,6 +47,10 @@ class Recording:
     confirmed_marks: List[ConfirmedMark]
     created_at: str
     versions: List[CueVersion] = field(default_factory=list)
+    # Reusable solver state of the *current* version only.  It is replaced
+    # together with the version swap and dropped for superseded versions, so
+    # each recording keeps exactly one state.
+    solver_state: SolverState | None = None
 
     @property
     def current_version(self) -> CueVersion | None:
@@ -100,6 +104,7 @@ class Store:
         )
         with self.lock:
             self._append_version(recording, result, confirmed_marks, wav)
+            recording.solver_state = result.state
             self._recordings[recording.id] = recording
         return recording
 
@@ -138,20 +143,32 @@ class Store:
         self,
         recording_id: str,
         confirmed_marks: List[ConfirmedMark],
-        build: Callable[[Recording], Tuple[SolveResult, bytes]],
+        build: Callable[[Recording, "SolverState | None"], Tuple[SolveResult, bytes]],
     ) -> Tuple[Recording, CueVersion]:
-        """Solve and append a version atomically.
+        """Solve without the lock, then swap version and state atomically.
 
-        ``build`` performs the (possibly slow) solve/render.  If it raises,
-        the current version is untouched and the exception propagates.
+        ``build(recording, prev_state)`` performs the (possibly slow)
+        solve/render.  It runs *without* the store lock, so the current
+        version stays queryable and downloadable while the re-solve is in
+        progress.  If it raises, nothing is mutated and the current version
+        stands.  On success the new marks, the rendered cue track and the new
+        reusable solver state are installed in a single locked section, and
+        the superseded version's state is dropped (only the current version
+        keeps one).
         """
 
         with self.lock:
             recording = self._recordings.get(recording_id)
             if recording is None:
                 raise NotFoundError(f"recording {recording_id!r} not found")
-            result, wav = build(recording)
+            prev_state = recording.solver_state
+        result, wav = build(recording, prev_state)
+        with self.lock:
+            recording = self._recordings.get(recording_id)
+            if recording is None:  # pragma: no cover - no deletion API
+                raise NotFoundError(f"recording {recording_id!r} not found")
             version = self._append_version(recording, result, confirmed_marks, wav)
+            recording.solver_state = result.state
             return recording, version
 
     # ------------------------------------------------------------ queries

@@ -315,3 +315,129 @@ def test_full_30_seconds_eight_measures_end_to_end(client):
     with wave.open(io.BytesIO(cue.content), "rb") as wf:
         assert wf.getnframes() == n_samples
         assert (wf.getnchannels(), wf.getsampwidth(), wf.getframerate()) == (1, 2, 16000)
+
+
+# ------------------------------------------------------- incremental re-solve
+
+# Three-measure scenario (mirrors scripts/make_demo_inputs.py): moving the
+# confirmed beat 5 by two frames flips measure 3 — behind the unchanged
+# confirmed beat 9 — from blank to cued.
+THREE_MEASURE_FRAMES = 480
+THREE_MEASURE_BASE = [10 + 40 * i for i in range(12)]
+THREE_MEASURE_DECOYS = {208: 110, 248: 120, 288: 90, 333: 120, 369: 100, 411: 90}
+
+
+def three_measure_annotation(moved: bool) -> dict:
+    peaks = {f: 100 for f in THREE_MEASURE_BASE}
+    peaks.update(THREE_MEASURE_DECOYS)
+    return {
+        "measure_count": 3,
+        "min_gap_frames": 38,
+        "max_gap_frames": 46,
+        "confirmed_beats": [
+            {"beat": 1, "frame": 10},
+            {"beat": 5, "frame": 172 if moved else 170},
+            {"beat": 9, "frame": 330},
+            {"beat": 12, "frame": 450},
+        ],
+        "onset_scores": tolerant_scores(THREE_MEASURE_FRAMES, peaks),
+    }
+
+
+def three_measure_marks(moved: bool) -> dict:
+    return {
+        "confirmed_beats": [
+            {"beat": 1, "frame": 10},
+            {"beat": 5, "frame": 172 if moved else 170},
+            {"beat": 9, "frame": 330},
+            {"beat": 12, "frame": 450},
+        ]
+    }
+
+
+def test_moving_one_beat_flips_remote_measure_and_matches_fresh_solve(client):
+    wav = make_wav(n_samples=THREE_MEASURE_FRAMES * FRAME_SAMPLES)
+
+    # recording A: solved incrementally (version 1 -> move beat 5 -> version 2)
+    created = post_recording(client, wav, three_measure_annotation(moved=False))
+    assert created.status_code == 201, created.text
+    rid = created.json()["recording_id"]
+    v1 = created.json()["current_version"]
+    assert v1["ambiguous_measures"] == [3]  # measure 3 blank
+    assert v1["cued_measures"] == [1, 2]
+    assert v1["beat_positions"][9] is None  # beat 10 tied between two frames
+
+    # download version 1 before the swap; afterwards it must become 409
+    cue_v1 = client.get(f"/api/recordings/{rid}/versions/1/cue.wav")
+    assert cue_v1.status_code == 200
+
+    r = client.post(f"/api/recordings/{rid}/beats", json=three_measure_marks(moved=True))
+    assert r.status_code == 201, r.text
+    v2 = r.json()
+    assert v2["version"] == 2
+    assert v2["ambiguous_measures"] == []  # measure 3 gained clicks
+    assert v2["cued_measures"] == [1, 2, 3]
+    assert v2["beat_positions"][9] == 370
+
+    # version 1 is superseded after the swap
+    assert client.get(f"/api/recordings/{rid}/versions/1/cue.wav").status_code == 409
+
+    # recording B: the moved annotation solved from scratch in one shot
+    created_b = post_recording(client, wav, three_measure_annotation(moved=True))
+    assert created_b.status_code == 201, created_b.text
+    v1_b = created_b.json()["current_version"]
+
+    # score, positions and ambiguity of the incremental re-solve must equal
+    # the fresh full solve
+    assert v2["total_score"] == v1_b["total_score"]
+    assert v2["beat_positions"] == v1_b["beat_positions"]
+    assert v2["ambiguous_measures"] == v1_b["ambiguous_measures"]
+    assert v2["cued_measures"] == v1_b["cued_measures"]
+
+    # the downloaded cue tracks must be byte-identical
+    cue_a = client.get(f"/api/recordings/{rid}/versions/2/cue.wav")
+    cue_b = client.get(
+        f"/api/recordings/{created_b.json()['recording_id']}/versions/1/cue.wav"
+    )
+    assert cue_a.status_code == cue_b.status_code == 200
+    assert cue_a.content == cue_b.content
+
+    # measure 3 is silent in version 1 and clicks in version 2
+    samples_v1 = np.frombuffer(cue_v1.content[44:], dtype="<i2")
+    samples_v2 = np.frombuffer(cue_a.content[44:], dtype="<i2")
+    m3 = slice(330 * FRAME_SAMPLES, 451 * FRAME_SAMPLES)
+    assert np.max(np.abs(samples_v1[m3])) == 0
+    assert np.max(np.abs(samples_v2[m3])) > 500
+
+
+def test_reannotation_uses_current_state_and_keeps_api_shape(client):
+    created = post_recording(client, make_wav(), base_annotation()).json()
+    rid = created["recording_id"]
+    good = {
+        "confirmed_beats": [
+            {"beat": 1, "frame": 10},
+            {"beat": 5, "frame": 171},
+            {"beat": 8, "frame": 290},
+        ]
+    }
+    r = client.post(f"/api/recordings/{rid}/beats", json=good)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    # response shape is unchanged
+    assert set(body) == {
+        "version",
+        "is_current",
+        "total_score",
+        "beat_positions",
+        "ambiguous_measures",
+        "cued_measures",
+        "confirmed_beats",
+        "created_at",
+        "download_url",
+        "recording_id",
+        "measure_count",
+        "min_gap_frames",
+        "max_gap_frames",
+    }
+    assert body["version"] == 2
+    assert body["is_current"] is True
