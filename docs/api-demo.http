@@ -1,0 +1,46 @@
+# API 演示请求（可直接粘贴执行）
+# 前提：docker compose up --build -d 已在 http://localhost:8000 启动服务
+
+### 0. 生成演示输入（3 秒 WAV + 标注 JSON）
+# python3 scripts/make_demo_inputs.py /tmp/demo
+
+### 健康检查
+GET http://localhost:8000/healthz
+
+### 1. 上传录音并创建第 1 版
+# 第 5 拍在 170/171 两帧并列最高分，最高分节拍线中不唯一
+# → 第 2 小节整节留白，ambiguous_measures = [2]
+POST http://localhost:8000/api/recordings
+Content-Type: multipart/form-data; boundary=----demo
+
+------demo
+Content-Disposition: form-data; name="audio"; filename="take.wav"
+Content-Type: audio/wav
+
+< /tmp/demo/take.wav
+------demo
+Content-Disposition: form-data; name="annotation"
+
+{"measure_count": 2, "min_gap_frames": 38, "max_gap_frames": 46, "confirmed_beats": [{"beat": 1, "frame": 10}, {"beat": 8, "frame": 290}], "onset_scores": [0, ...]}
+------demo--
+
+### 2. 下载第 1 版提示轨（与原录音等长同规格）
+GET http://localhost:8000/api/recordings/{{recording_id}}/versions/1/cue.wav
+
+### 3. 重提人工拍点，确认第 5 拍 → 生成第 2 版，两小节均有提示音
+POST http://localhost:8000/api/recordings/{{recording_id}}/beats
+Content-Type: application/json
+
+{"confirmed_beats": [{"beat": 1, "frame": 10}, {"beat": 5, "frame": 170}, {"beat": 8, "frame": 290}]}
+
+### 4. 重提一个无解拍点（末拍 40 帧，7 段间距无法同时满足）→ 422，保留当前版本
+POST http://localhost:8000/api/recordings/{{recording_id}}/beats
+Content-Type: application/json
+
+{"confirmed_beats": [{"beat": 1, "frame": 10}, {"beat": 8, "frame": 40}]}
+
+### 5. 下载已作废的第 1 版 → 409
+GET http://localhost:8000/api/recordings/{{recording_id}}/versions/1/cue.wav
+
+### 6. 录音元数据与版本历史
+GET http://localhost:8000/api/recordings/{{recording_id}}
